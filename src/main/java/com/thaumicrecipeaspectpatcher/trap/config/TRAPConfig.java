@@ -60,8 +60,15 @@ public class TRAPConfig {
     };
 
     private final List<RecipeRule> rules = new ArrayList<>();
+    private File configDir;
+
+    /** Returns the Forge mod-config directory used when this config was loaded. */
+    public File getConfigDir() {
+        return configDir;
+    }
 
     public void load(File configDir) {
+        this.configDir = configDir;
         File configFile = new File(configDir, Tags.MOD_ID + ".cfg");
         Configuration cfg = new Configuration(configFile);
 

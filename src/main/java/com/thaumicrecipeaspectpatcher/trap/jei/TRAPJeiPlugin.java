@@ -2,6 +2,7 @@ package com.thaumicrecipeaspectpatcher.trap.jei;
 
 import com.thaumicrecipeaspectpatcher.trap.Tags;
 import com.thaumicrecipeaspectpatcher.trap.config.RecipeRule;
+import com.thaumicrecipeaspectpatcher.trap.config.TRAPCache;
 import com.thaumicrecipeaspectpatcher.trap.config.TRAPConfig;
 import mezz.jei.api.IJeiRuntime;
 import mezz.jei.api.IModPlugin;
@@ -18,24 +19,26 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import thaumcraft.api.ThaumcraftApi;
 import thaumcraft.api.aspects.Aspect;
-import thaumcraft.api.aspects.AspectEventProxy;
 import thaumcraft.api.aspects.AspectList;
 
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
- * JEI plugin entry point for ThaumicRecipeAspectPatcher.
+ * JEI plugin entry point for ThaumicRecipeAspectPatcher (CLIENT ONLY).
  *
- * When JEI finishes initializing ({@code onRuntimeAvailable}), this class
- * iterates every configured recipe rule, finds the matching JEI category,
- * and for each recipe wrapper:
- *   1. Collects all non-blacklisted input ItemStacks.
- *   2. Sums their Thaumcraft aspects via ThaumcraftApi.internalMethods.
- *   3. Registers the summed aspects on every non-blacklisted output ItemStack
- *      via AspectEventProxy.registerComplexObjectTag.
+ * Runs only when JEI is present.  On {@code onRuntimeAvailable}:
+ *   1. Check whether {@code config/trap_cache.json} is still valid
+ *      (its stored config-hash matches the current {@code trap.cfg}).
+ *   2. If valid  → load the cache and apply it to the client's objectTags.
+ *   3. If invalid/missing → iterate all configured JEI recipe categories,
+ *      compute per-output AspectLists, write a new cache, then apply it.
  *
- * AspectEventProxy writes directly into CommonInternals.objectTags (a
- * ConcurrentHashMap), so calling it at runtime is safe.
+ * The server side never runs JEI; instead it reads the same cache file during
+ * FMLServerStartingEvent (see ThaumicRecipeAspectPatcher) and applies it to
+ * the server's objectTags.
  */
 @JEIPlugin
 @SideOnly(Side.CLIENT)
@@ -47,38 +50,55 @@ public class TRAPJeiPlugin implements IModPlugin {
     public void onRuntimeAvailable(IJeiRuntime runtime) {
         TRAPConfig config = TRAPConfig.INSTANCE;
         if (config == null) {
-            LOGGER.warn("TRAPJeiPlugin: TRAPConfig.INSTANCE is null - skipping aspect patching.");
+            LOGGER.warn("TRAP: TRAPConfig.INSTANCE is null - skipping aspect patching.");
             return;
         }
+
+        File configDir = config.getConfigDir();
+
+        // --- Try loading an existing valid cache first ---
+        TRAPCache existing = TRAPCache.load(configDir);
+        if (existing != null && existing.isValid(configDir)) {
+            LOGGER.info("TRAP: Valid cache found ({} entries). Applying to client.", existing.entries.size());
+            int applied = existing.apply();
+            LOGGER.info("TRAP: Client applied {} aspect override(s) from cache.", applied);
+            return;
+        }
+
+        // --- Cache missing or outdated: recompute from JEI ---
+        LOGGER.info("TRAP: Cache is missing or outdated - recomputing from JEI recipes...");
 
         List<RecipeRule> rules = config.getRules();
+        TRAPCache newCache = new TRAPCache();
+        newCache.configHash = TRAPCache.hashConfigFile(configDir);
+        newCache.entries = new ArrayList<>();
+
         if (rules.isEmpty()) {
-            LOGGER.info("No recipe rules configured - nothing to patch.");
+            LOGGER.info("TRAP: No rules configured - saving empty cache.");
+            newCache.save(configDir);
             return;
         }
 
-        // AspectEventProxy has a public no-arg constructor; its methods write to
-        // CommonInternals.objectTags (ConcurrentHashMap) which is always accessible.
-        AspectEventProxy proxy = new AspectEventProxy();
         IRecipeRegistry registry = runtime.getRecipeRegistry();
-        int totalPatched = 0;
-
         for (RecipeRule rule : rules) {
             IRecipeCategory<?> category = findCategory(registry, rule);
             if (category == null) {
-                LOGGER.warn("No JEI category found for rule '{}:{}' - tried UIDs: {}",
+                LOGGER.warn("TRAP: No JEI category found for rule '{}:{}' - tried UIDs: {}",
                         rule.modId, rule.recipeTypeId,
                         String.join(", ", rule.candidateUids()));
                 continue;
             }
-
-            int patched = processCategory(registry, proxy, category, rule);
-            LOGGER.info("Rule '{}:{}' - patched {} output(s) in category '{}'.",
-                    rule.modId, rule.recipeTypeId, patched, category.getUid());
-            totalPatched += patched;
+            List<TRAPCache.Entry> entries = processCategory(registry, category, rule);
+            LOGGER.info("TRAP: Rule '{}:{}' → {} cache entries in category '{}'.",
+                    rule.modId, rule.recipeTypeId, entries.size(), category.getUid());
+            newCache.entries.addAll(entries);
         }
 
-        LOGGER.info("TRAP aspect patching complete - total outputs patched: {}.", totalPatched);
+        LOGGER.info("TRAP: Computed {} total aspect entries. Saving cache...", newCache.entries.size());
+        newCache.save(configDir);
+
+        int applied = newCache.apply();
+        LOGGER.info("TRAP: Client applied {} aspect override(s) from newly computed cache.", applied);
     }
 
     // -------------------------------------------------------------------------
@@ -88,82 +108,66 @@ public class TRAPJeiPlugin implements IModPlugin {
     private IRecipeCategory<?> findCategory(IRecipeRegistry registry, RecipeRule rule) {
         for (String uid : rule.candidateUids()) {
             IRecipeCategory<?> cat = registry.getRecipeCategory(uid);
-            if (cat != null) {
-                return cat;
-            }
+            if (cat != null) return cat;
         }
         return null;
     }
 
-    /** Processes all recipes in a category. Returns count of patched outputs. */
+    /** Processes all wrappers in a category and collects cache entries. */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private int processCategory(IRecipeRegistry registry,
-                                AspectEventProxy proxy,
-                                IRecipeCategory category,
-                                RecipeRule rule) {
+    private List<TRAPCache.Entry> processCategory(IRecipeRegistry registry,
+                                                  IRecipeCategory category,
+                                                  RecipeRule rule) {
         List<IRecipeWrapper> wrappers = registry.getRecipeWrappers(category);
-        int count = 0;
+        List<TRAPCache.Entry> result = new ArrayList<>();
         for (IRecipeWrapper wrapper : wrappers) {
-            count += processWrapper(proxy, wrapper, rule);
+            result.addAll(processWrapper(wrapper, rule));
         }
-        return count;
+        return result;
     }
 
     /**
-     * Sums input aspects and assigns them to output ItemStacks for one recipe.
-     *
-     * @return number of output ItemStacks patched.
+     * Sums input aspects and builds one {@link TRAPCache.Entry} per output
+     * ItemStack for a single recipe wrapper.
      */
-    private int processWrapper(AspectEventProxy proxy,
-                               IRecipeWrapper wrapper,
-                               RecipeRule rule) {
-        // Use JEI's own Ingredients class - at onRuntimeAvailable time
-        // Internal.getIngredientRegistry() is fully available.
+    private List<TRAPCache.Entry> processWrapper(IRecipeWrapper wrapper, RecipeRule rule) {
         Ingredients ingredients = new Ingredients();
         try {
             wrapper.getIngredients(ingredients);
         } catch (Exception e) {
-            LOGGER.debug("getIngredients() threw for {}: {}",
+            LOGGER.debug("TRAP: getIngredients() threw for {}: {}",
                     wrapper.getClass().getName(), e.getMessage());
-            return 0;
+            return Collections.emptyList();
         }
 
-        // Sum aspects from input slots (skip blacklisted slots).
+        // Sum aspects from all non-blacklisted input slots.
+        // add(aspect, amount) accumulates correctly; merge() would take MAX instead.
         List<List<ItemStack>> inputLists = ingredients.getInputs(VanillaTypes.ITEM);
         AspectList summed = new AspectList();
         for (int slot = 0; slot < inputLists.size(); slot++) {
             if (rule.blacklistedInputSlots.contains(slot)) continue;
             List<ItemStack> slotStacks = inputLists.get(slot);
             if (slotStacks == null || slotStacks.isEmpty()) continue;
-            // All stacks in the same slot are alternates (subtypes); pick the first representative.
+            // Multiple stacks in one slot = alternates; use the first as representative.
             ItemStack rep = slotStacks.get(0);
             if (rep == null || rep.isEmpty()) continue;
             AspectList itemAspects = ThaumcraftApi.internalMethods.getObjectAspects(rep);
             if (itemAspects == null) continue;
-            // getObjectAspects returns aspects for a single item regardless of stack size,
-            // so multiply by the count actually required by this recipe slot.
-            // NOTE: use add() not merge()! merge(Aspect,int) takes MAX of old/new values,
-            // whereas add(Aspect,int) accumulates (iadd). Using merge would cause all
-            // identical-aspect inputs to count only once instead of being summed.
+            // getObjectAspects returns per-item values; scale by actual slot count.
             int count = Math.max(1, rep.getCount());
             for (Aspect aspect : itemAspects.getAspects()) {
                 summed.add(aspect, itemAspects.getAmount(aspect) * count);
             }
         }
 
-        if (summed.size() == 0) {
-            return 0;
-        }
+        if (summed.size() == 0) return Collections.emptyList();
 
-        // Assign aspects to output slots (skip blacklisted slots).
-        // Thaumcraft stores aspects as a per-item property, and registerComplexObjectTag
-        // sets the value for ONE instance of that item. Divide the total input sum by the
-        // recipe output count so that value is proportionally correct:
-        //   64 cobble (Terra×64) → 5 giant cobble: each giant = Terra×12 (64/5)
-        //   64 cobble (Terra×64) → 1 giant cobble:  each giant = Terra×64 (64/1)
-        // Integer division is used; minimum per-aspect value is 1.
+        // Build one cache entry per output stack, dividing the summed aspects by
+        // the output count so that each item gets a proportional per-item value.
+        //   64 cobble → 5 giant cobble: each giant = floor(Terra×64 / 5) = Terra×12
+        //   64 cobble → 1 giant cobble: each giant = Terra×64
         List<List<ItemStack>> outputLists = ingredients.getOutputs(VanillaTypes.ITEM);
-        int patched = 0;
+        List<TRAPCache.Entry> result = new ArrayList<>();
         for (int slot = 0; slot < outputLists.size(); slot++) {
             if (rule.blacklistedOutputSlots.contains(slot)) continue;
             List<ItemStack> slotStacks = outputLists.get(slot);
@@ -172,23 +176,22 @@ public class TRAPJeiPlugin implements IModPlugin {
                 if (output == null || output.isEmpty()) continue;
                 int outCount = Math.max(1, output.getCount());
                 AspectList perItem = scaleAspects(summed, outCount);
-                proxy.registerComplexObjectTag(output.copy(), perItem);
-                patched++;
+                result.add(TRAPCache.Entry.of(output, perItem));
             }
         }
-        return patched;
+        return result;
     }
 
     /**
-     * Returns a new AspectList with every value divided by {@code divisor}.
-     * Integer division; each aspect's value is at least 1.
+     * Returns a copy of {@code src} with every aspect value divided by
+     * {@code divisor} (integer division, minimum 1 per aspect).
      */
     private static AspectList scaleAspects(AspectList src, int divisor) {
         if (divisor <= 1) return src.copy();
         AspectList result = new AspectList();
         for (Aspect aspect : src.getAspects()) {
             int amount = Math.max(1, src.getAmount(aspect) / divisor);
-            result.merge(aspect, amount);
+            result.add(aspect, amount);
         }
         return result;
     }
