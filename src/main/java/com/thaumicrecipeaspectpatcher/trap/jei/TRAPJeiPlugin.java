@@ -25,6 +25,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * JEI plugin entry point for ThaumicRecipeAspectPatcher (CLIENT ONLY).
@@ -71,6 +72,7 @@ public class TRAPJeiPlugin implements IModPlugin {
         List<RecipeRule> rules = config.getRules();
         TRAPCache newCache = new TRAPCache();
         newCache.configHash = TRAPCache.hashConfigFile(configDir);
+        newCache.formatVersion = TRAPCache.CURRENT_FORMAT_VERSION;
         newCache.entries = new ArrayList<>();
 
         if (rules.isEmpty()) {
@@ -158,6 +160,17 @@ public class TRAPJeiPlugin implements IModPlugin {
             int count = Math.max(1, rep.getCount());
             for (Aspect aspect : itemAspects.getAspects()) {
                 summed.add(aspect, itemAspects.getAmount(aspect) * count);
+            }
+        }
+
+        // Add any extra aspects declared in the rule.
+        for (Map.Entry<String, Integer> entry : rule.extraAspects.entrySet()) {
+            Aspect aspect = Aspect.getAspect(entry.getKey());
+            if (aspect != null) {
+                summed.add(aspect, entry.getValue());
+            } else {
+                LOGGER.warn("TRAP: Unknown aspect tag '{}' in extra_aspects for rule '{}:{}', ignoring.",
+                        entry.getKey(), rule.modId, rule.recipeTypeId);
             }
         }
 

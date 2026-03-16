@@ -39,6 +39,15 @@ public class TRAPCache {
     public static final String CACHE_FILENAME = "trap_cache.json";
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    /**
+     * Incremented whenever the cache format or parsing logic changes in a way
+     * that makes old cached data invalid.
+     */
+    public static final int CURRENT_FORMAT_VERSION = 2;
+
+    /** Format version stored when this cache was written. */
+    public int formatVersion;
+
     /** SHA-1 hex of {@code trap.cfg} at the time this cache was last built. */
     public String configHash;
 
@@ -166,9 +175,10 @@ public class TRAPCache {
 
     /**
      * Returns {@code true} if the config hash stored inside this cache matches
-     * the current content of {@code trap.cfg}.
+     * the current content of {@code trap.cfg}, AND the format version matches.
      */
     public boolean isValid(File configDir) {
+        if (formatVersion != CURRENT_FORMAT_VERSION) return false;
         String current = hashConfigFile(configDir);
         return current != null && current.equals(configHash);
     }

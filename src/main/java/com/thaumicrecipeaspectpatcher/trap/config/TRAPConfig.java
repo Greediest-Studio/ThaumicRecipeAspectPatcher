@@ -38,8 +38,8 @@ public class TRAPConfig {
     private static final String CONFIG_CATEGORY = "rules";
     private static final String CONFIG_KEY = "recipe_rules";
     private static final String[] DEFAULT_RULES = {
-        "# Format: modid:recipe_type_id:[blacklist_input_slots]:[blacklist_output_slots]:[excluded_items]",
-        "# The last three bracket parameters are optional.",
+        "# Format: modid:recipe_type_id:[blacklist_input_slots]:[blacklist_output_slots]:[excluded_items]:[extra_aspects]",
+        "# The last four bracket parameters are optional.",
         "#",
         "# If the JEI category UID contains no colon (no modid prefix),",
         "# write the full UID directly without a modid:",
@@ -52,6 +52,9 @@ public class TRAPConfig {
         "# excluded_items: comma-separated list of items to exclude from aspect calculation",
         "# (applied to both inputs and outputs). Format: modid:item@metadata or modid:item",
         "# Omitting @metadata matches all metadata values.",
+        "#",
+        "# extra_aspects: comma-separated list of aspects unconditionally added to the sum.",
+        "# Format: aspectname:amount (e.g. ignis:10,terra:5). Added before dividing by output count.",
         "#",
         "# Example - patch vanilla crafting recipes:",
         "#   minecraft:crafting",
@@ -119,61 +122,60 @@ public class TRAPConfig {
      * Parses a single config line into a RecipeRule.
      * Returns null and logs a warning on parse failure.
      *
-     * Grammar:
-     *   <uid>                                                  (direct UID, no colon)
-     *   <modid>:<recipe_type_id>                               (modid + type)
-     *   <modid>:<recipe_type_id>:[<slots>]                     (+ input blacklist)
-     *   <modid>:<recipe_type_id>:[<slots>]:[<slots>]           (+ output blacklist)
-     *   <modid>:<recipe_type_id>:[<slots>]:[<slots>]:[<items>] (+ excluded items)
+     * Grammar (both separator styles are accepted):
+     *   <uid>                                                    (no brackets)
+     *   <uid>,[s1]                                               (comma-separated, up to 4 bracket sections)
+     *   <uid>:[s1]:[s2]:[s3]:[s4]                               (colon-separated)
      *
-     * If the line contains no colon before the first '[', the entire non-bracket
-     * portion is treated as a direct JEI category UID (modId stored as "").
+     * Bracket sections in order: [inputSlots],[outputSlots],[excludedItems],[extraAspects]
+     * Each section is optional (omit trailing sections or leave content empty).
+     * The separator between UID and brackets, and between bracket sections, may be
+     * either ',' or ':' — both are supported, and they may be mixed within one line.
      *
-     * where <slots> = comma-separated integers, may be empty.
-     * where <items> = comma-separated item identifiers (modid:item@metadata or modid:item).
+     * where <slots>   = comma-separated integers, may be empty.
+     * where <items>   = comma-separated item identifiers (modid:item@metadata or modid:item).
+     * where <aspects> = comma-separated aspect:amount pairs (e.g. ignis:10,terra:5).
      */
     private RecipeRule parseLine(String line) {
         try {
-            // Split out optional bracket sections first to avoid ambiguity with `:` in UID.
-            // Bracket sections are always `:[...]` so we split on `:['.
             String idPart;
             String inputPart = "";
             String outputPart = "";
             String itemsPart = "";
+            String aspectsPart = "";
 
-            int bracketStart = line.indexOf(":[");
-            if (bracketStart >= 0) {
-                idPart = line.substring(0, bracketStart);
-                String remainder = line.substring(bracketStart + 1); // starts with `[`
-
-                int closeFirst = remainder.indexOf(']');
-                if (closeFirst < 0) {
-                    LOGGER.warn("Malformed rule (missing ']'): {}", line);
-                    return null;
+            int firstBracket = line.indexOf('[');
+            if (firstBracket >= 0) {
+                // Everything before the first '[', minus the immediate separator char (':' or ',').
+                int sepIdx = firstBracket - 1;
+                if (sepIdx >= 0 && (line.charAt(sepIdx) == ':' || line.charAt(sepIdx) == ',')) {
+                    idPart = line.substring(0, sepIdx);
+                } else {
+                    idPart = line.substring(0, firstBracket);
                 }
-                inputPart = remainder.substring(1, closeFirst).trim(); // inside first []
 
-                // look for second bracket section `:[`
-                String afterFirst = remainder.substring(closeFirst + 1);
-                int secondBracket = afterFirst.indexOf(":[");
-                if (secondBracket >= 0) {
-                    String outputSection = afterFirst.substring(secondBracket + 1);
-                    int closeSecond = outputSection.indexOf(']');
-                    if (closeSecond >= 0) {
-                        outputPart = outputSection.substring(1, closeSecond).trim();
-
-                        // look for third bracket section `:[ ` (excluded items)
-                        String afterSecond = outputSection.substring(closeSecond + 1);
-                        int thirdBracket = afterSecond.indexOf(":[");
-                        if (thirdBracket >= 0) {
-                            String itemsSection = afterSecond.substring(thirdBracket + 1);
-                            int closeThird = itemsSection.indexOf(']');
-                            if (closeThird >= 0) {
-                                itemsPart = itemsSection.substring(1, closeThird).trim();
-                            }
-                        }
+                // Scan bracket groups one by one.
+                // Between groups the separator is exactly one ':' or ',' character.
+                List<String> sections = new ArrayList<>();
+                int pos = firstBracket;
+                while (pos < line.length() && line.charAt(pos) == '[') {
+                    int close = line.indexOf(']', pos + 1);
+                    if (close < 0) {
+                        LOGGER.warn("Malformed rule (missing ']'): {}", line);
+                        return null;
+                    }
+                    sections.add(line.substring(pos + 1, close).trim());
+                    pos = close + 1;
+                    // Skip exactly one separator character before the next potential '['.
+                    if (pos < line.length() && (line.charAt(pos) == ',' || line.charAt(pos) == ':')) {
+                        pos++;
                     }
                 }
+
+                if (sections.size() > 0) inputPart   = sections.get(0);
+                if (sections.size() > 1) outputPart  = sections.get(1);
+                if (sections.size() > 2) itemsPart   = sections.get(2);
+                if (sections.size() > 3) aspectsPart = sections.get(3);
             } else {
                 idPart = line;
             }
@@ -202,8 +204,9 @@ public class TRAPConfig {
             Set<Integer> inputBlacklist = parseSlots(inputPart);
             Set<Integer> outputBlacklist = parseSlots(outputPart);
             Set<String> excludedItems = parseItemList(itemsPart);
+            Map<String, Integer> extraAspects = parseAspectMap(aspectsPart);
 
-            return new RecipeRule(modId, recipeTypeId, inputBlacklist, outputBlacklist, excludedItems);
+            return new RecipeRule(modId, recipeTypeId, inputBlacklist, outputBlacklist, excludedItems, extraAspects);
 
         } catch (Exception e) {
             LOGGER.warn("Failed to parse rule '{}': {}", line, e.getMessage());
@@ -244,6 +247,38 @@ public class TRAPConfig {
             String t = tok.trim().toLowerCase(java.util.Locale.ROOT);
             if (!t.isEmpty()) {
                 result.add(t);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Parses a comma-separated aspect:amount list into a Map.
+     * Each token must be "aspectname:integer" (e.g. "ignis:10").
+     * Aspect names are stored lowercased.
+     */
+    private Map<String, Integer> parseAspectMap(String raw) {
+        Map<String, Integer> result = new LinkedHashMap<>();
+        if (raw == null || raw.isEmpty()) {
+            return result;
+        }
+        for (String tok : raw.split(",")) {
+            String t = tok.trim();
+            if (t.isEmpty()) continue;
+            int colon = t.lastIndexOf(':');
+            if (colon <= 0 || colon == t.length() - 1) {
+                LOGGER.warn("Invalid extra aspect entry '{}', expected 'aspectname:amount', ignoring.", t);
+                continue;
+            }
+            String aspectName = t.substring(0, colon).trim().toLowerCase(java.util.Locale.ROOT);
+            String amountStr = t.substring(colon + 1).trim();
+            try {
+                int amount = Integer.parseInt(amountStr);
+                if (amount > 0) {
+                    result.merge(aspectName, amount, Integer::sum);
+                }
+            } catch (NumberFormatException e) {
+                LOGGER.warn("Invalid aspect amount '{}' in '{}', ignoring.", amountStr, t);
             }
         }
         return result;

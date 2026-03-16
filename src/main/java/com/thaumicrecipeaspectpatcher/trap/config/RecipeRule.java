@@ -4,11 +4,12 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.util.ResourceLocation;
 
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * Represents one line in the TRAP config file.
- * Format: modid:recipe_type_id:[inputBlacklist]:[outputBlacklist]:[excludedItems]
+ * Format: modid:recipe_type_id:[inputBlacklist]:[outputBlacklist]:[excludedItems]:[extraAspects]
  */
 public class RecipeRule {
 
@@ -37,15 +38,23 @@ public class RecipeRule {
      */
     public final Set<String> excludedItems;
 
+    /**
+     * Extra aspects to unconditionally add to the summed input aspects before
+     * distribution to outputs. Maps lowercase aspect tag name → amount.
+     */
+    public final Map<String, Integer> extraAspects;
+
     public RecipeRule(String modId, String recipeTypeId,
                       Set<Integer> blacklistedInputSlots,
                       Set<Integer> blacklistedOutputSlots,
-                      Set<String> excludedItems) {
+                      Set<String> excludedItems,
+                      Map<String, Integer> extraAspects) {
         this.modId = modId;
         this.recipeTypeId = recipeTypeId;
         this.blacklistedInputSlots = Collections.unmodifiableSet(blacklistedInputSlots);
         this.blacklistedOutputSlots = Collections.unmodifiableSet(blacklistedOutputSlots);
         this.excludedItems = Collections.unmodifiableSet(excludedItems);
+        this.extraAspects = Collections.unmodifiableMap(extraAspects);
     }
 
     /**
@@ -90,6 +99,7 @@ public class RecipeRule {
         return modId + ":" + recipeTypeId
                 + " inputs_blacklist=" + blacklistedInputSlots
                 + " outputs_blacklist=" + blacklistedOutputSlots
-                + " excluded_items=" + excludedItems;
+                + " excluded_items=" + excludedItems
+                + " extra_aspects=" + extraAspects;
     }
 }
