@@ -13,6 +13,7 @@ import mezz.jei.api.recipe.IRecipeCategory;
 import mezz.jei.api.recipe.IRecipeWrapper;
 import mezz.jei.ingredients.Ingredients;
 import net.minecraft.item.ItemStack;
+import net.minecraft.util.ResourceLocation;
 import net.minecraftforge.fml.relauncher.Side;
 import net.minecraftforge.fml.relauncher.SideOnly;
 import org.apache.logging.log4j.LogManager;
@@ -24,8 +25,12 @@ import thaumcraft.api.aspects.AspectList;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * JEI plugin entry point for ThaumicRecipeAspectPatcher (CLIENT ONLY).
@@ -82,6 +87,11 @@ public class TRAPJeiPlugin implements IModPlugin {
         }
 
         IRecipeRegistry registry = runtime.getRecipeRegistry();
+
+        // ---- Phase 1: compute aspects using only existing game data ----
+        // Wrappers whose inputs contained items with no aspects are queued for
+        // a second pass once the phase-1 outputs have been collected.
+        List<Object[]> retryQueue = new ArrayList<>(); // { IRecipeWrapper, RecipeRule, Set<String> missingKeys }
         for (RecipeRule rule : rules) {
             IRecipeCategory<?> category = findCategory(registry, rule);
             if (category == null) {
@@ -90,10 +100,68 @@ public class TRAPJeiPlugin implements IModPlugin {
                         String.join(", ", rule.candidateUids()));
                 continue;
             }
-            List<TRAPCache.Entry> entries = processCategory(registry, category, rule);
-            LOGGER.info("TRAP: Rule '{}:{}' → {} cache entries in category '{}'.",
-                    rule.modId, rule.recipeTypeId, entries.size(), category.getUid());
-            newCache.entries.addAll(entries);
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            List<IRecipeWrapper> wrappers = ((IRecipeRegistry) registry).getRecipeWrappers((IRecipeCategory) category);
+            int count = 0;
+            for (IRecipeWrapper wrapper : wrappers) {
+                WrapperResult wr = processWrapper(wrapper, rule, Collections.emptyMap());
+                newCache.entries.addAll(wr.entries);
+                count += wr.entries.size();
+                if (!wr.missingInputKeys.isEmpty()) {
+                    retryQueue.add(new Object[]{wrapper, rule, wr.missingInputKeys});
+                }
+            }
+            LOGGER.info("TRAP: Rule '{}:{}' (phase 1) \u2192 {} cache entries in category '{}'.",
+                    rule.modId, rule.recipeTypeId, count, category.getUid());
+        }
+
+        // ---- Phase 2: re-evaluate wrappers that had missing-aspect inputs ----
+        // Build a supplementary map from phase-1 outputs so subsequent lookups
+        // can resolve items that were not in the game's objectTags yet.
+        if (!retryQueue.isEmpty()) {
+            Map<String, AspectList> supplementary = new HashMap<>();
+            for (TRAPCache.Entry e : newCache.entries) {
+                AspectList al = e.toAspectList();
+                if (al.size() > 0) {
+                    supplementary.putIfAbsent(e.registryName + "@" + e.meta, al);
+                }
+            }
+
+            // Index existing entries so phase-2 results can replace them.
+            Map<String, TRAPCache.Entry> entriesMap = new LinkedHashMap<>();
+            for (TRAPCache.Entry e : newCache.entries) {
+                entriesMap.put(entryKey(e), e);
+            }
+
+            int retriedCount = 0;
+            for (Object[] item : retryQueue) {
+                IRecipeWrapper wrapper = (IRecipeWrapper) item[0];
+                RecipeRule rule = (RecipeRule) item[1];
+                @SuppressWarnings("unchecked")
+                Set<String> missingKeys = (Set<String>) item[2];
+
+                // Only worth retrying if at least one previously-missing input
+                // has now been assigned aspects in supplementary.
+                boolean anyResolved = false;
+                for (String key : missingKeys) {
+                    if (supplementary.containsKey(key)) { anyResolved = true; break; }
+                }
+                if (!anyResolved) continue;
+
+                WrapperResult retried = processWrapper(wrapper, rule, supplementary);
+                if (retried.entries.isEmpty()) continue;
+
+                for (TRAPCache.Entry e : retried.entries) {
+                    entriesMap.put(entryKey(e), e);
+                }
+                retriedCount++;
+            }
+
+            if (retriedCount > 0) {
+                LOGGER.info("TRAP: Phase 2 re-evaluated {} wrapper(s) with resolved inputs. Total entries: {}.",
+                        retriedCount, entriesMap.size());
+                newCache.entries = new ArrayList<>(entriesMap.values());
+            }
         }
 
         LOGGER.info("TRAP: Computed {} total aspect entries. Saving cache...", newCache.entries.size());
@@ -115,37 +183,70 @@ public class TRAPJeiPlugin implements IModPlugin {
         return null;
     }
 
-    /** Processes all wrappers in a category and collects cache entries. */
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private List<TRAPCache.Entry> processCategory(IRecipeRegistry registry,
-                                                  IRecipeCategory category,
-                                                  RecipeRule rule) {
-        List<IRecipeWrapper> wrappers = registry.getRecipeWrappers(category);
-        List<TRAPCache.Entry> result = new ArrayList<>();
-        for (IRecipeWrapper wrapper : wrappers) {
-            result.addAll(processWrapper(wrapper, rule));
+    // -------------------------------------------------------------------------
+
+    /**
+     * Result of processing one recipe wrapper.
+     * {@code missingInputKeys} contains "registryName@meta" keys for every
+     * non-excluded, non-empty input slot that had no aspect data from any source.
+     */
+    private static class WrapperResult {
+        final List<TRAPCache.Entry> entries;
+        final Set<String> missingInputKeys;
+        WrapperResult(List<TRAPCache.Entry> entries, Set<String> missingInputKeys) {
+            this.entries = entries;
+            this.missingInputKeys = missingInputKeys;
         }
-        return result;
+    }
+
+    /**
+     * Returns a unique string key for a cache entry, used to detect duplicate
+     * output items across wrappers so phase-2 results can replace phase-1 ones.
+     */
+    private static String entryKey(TRAPCache.Entry e) {
+        return e.registryName + "@" + e.meta + (e.nbt != null ? "#" + e.nbt : "");
+    }
+
+    /**
+     * Look up aspects for {@code stack}.
+     * Checks {@code supplementary} first (phase-2 computed data), then falls
+     * back to Thaumcraft's live objectTags.
+     */
+    private static AspectList lookupAspects(ItemStack stack, Map<String, AspectList> supplementary) {
+        if (!supplementary.isEmpty()) {
+            ResourceLocation rn = stack.getItem().getRegistryName();
+            if (rn != null) {
+                AspectList sup = supplementary.get(rn.toString() + "@" + stack.getMetadata());
+                if (sup != null && sup.size() > 0) return sup;
+            }
+        }
+        return ThaumcraftApi.internalMethods.getObjectAspects(stack);
     }
 
     /**
      * Sums input aspects and builds one {@link TRAPCache.Entry} per output
      * ItemStack for a single recipe wrapper.
+     *
+     * @param supplementary aspects computed by phase 1, used to resolve inputs
+     *                       that had no data in the live game objectTags yet.
+     *                       Pass an empty map during phase 1.
      */
-    private List<TRAPCache.Entry> processWrapper(IRecipeWrapper wrapper, RecipeRule rule) {
+    private WrapperResult processWrapper(IRecipeWrapper wrapper, RecipeRule rule,
+                                         Map<String, AspectList> supplementary) {
         Ingredients ingredients = new Ingredients();
         try {
             wrapper.getIngredients(ingredients);
         } catch (Exception e) {
             LOGGER.debug("TRAP: getIngredients() threw for {}: {}",
                     wrapper.getClass().getName(), e.getMessage());
-            return Collections.emptyList();
+            return new WrapperResult(Collections.emptyList(), Collections.emptySet());
         }
 
         // Sum aspects from all non-blacklisted input slots.
         // add(aspect, amount) accumulates correctly; merge() would take MAX instead.
         List<List<ItemStack>> inputLists = ingredients.getInputs(VanillaTypes.ITEM);
         AspectList summed = new AspectList();
+        Set<String> missingInputKeys = new HashSet<>();
         for (int slot = 0; slot < inputLists.size(); slot++) {
             if (rule.blacklistedInputSlots.contains(slot)) continue;
             List<ItemStack> slotStacks = inputLists.get(slot);
@@ -154,8 +255,14 @@ public class TRAPJeiPlugin implements IModPlugin {
             ItemStack rep = slotStacks.get(0);
             if (rep == null || rep.isEmpty()) continue;
             if (rule.isItemExcluded(rep)) continue;
-            AspectList itemAspects = ThaumcraftApi.internalMethods.getObjectAspects(rep);
-            if (itemAspects == null) continue;
+            AspectList itemAspects = lookupAspects(rep, supplementary);
+            if (itemAspects == null || itemAspects.size() == 0) {
+                // Record this item as having no aspects so the caller can decide
+                // whether a phase-2 retry would help.
+                ResourceLocation rn = rep.getItem().getRegistryName();
+                if (rn != null) missingInputKeys.add(rn.toString() + "@" + rep.getMetadata());
+                continue;
+            }
             // getObjectAspects returns per-item values; scale by actual slot count.
             int count = Math.max(1, rep.getCount());
             for (Aspect aspect : itemAspects.getAspects()) {
@@ -174,7 +281,9 @@ public class TRAPJeiPlugin implements IModPlugin {
             }
         }
 
-        if (summed.size() == 0) return Collections.emptyList();
+        if (summed.size() == 0) {
+            return new WrapperResult(Collections.emptyList(), missingInputKeys);
+        }
 
         // Build one cache entry per output stack, dividing the summed aspects by
         // the output count so that each item gets a proportional per-item value.
@@ -194,7 +303,7 @@ public class TRAPJeiPlugin implements IModPlugin {
                 result.add(TRAPCache.Entry.of(output, perItem));
             }
         }
-        return result;
+        return new WrapperResult(result, missingInputKeys);
     }
 
     /**
