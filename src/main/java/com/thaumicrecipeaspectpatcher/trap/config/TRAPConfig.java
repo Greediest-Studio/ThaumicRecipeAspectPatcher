@@ -38,8 +38,8 @@ public class TRAPConfig {
     private static final String CONFIG_CATEGORY = "rules";
     private static final String CONFIG_KEY = "recipe_rules";
     private static final String[] DEFAULT_RULES = {
-        "# Format: modid:recipe_type_id:[blacklist_input_slots]:[blacklist_output_slots]",
-        "# The last two bracket parameters are optional.",
+        "# Format: modid:recipe_type_id:[blacklist_input_slots]:[blacklist_output_slots]:[excluded_items]",
+        "# The last three bracket parameters are optional.",
         "#",
         "# If the JEI category UID contains no colon (no modid prefix),",
         "# write the full UID directly without a modid:",
@@ -49,10 +49,16 @@ public class TRAPConfig {
         "# recipe_type_id must match a JEI category UID.",
         "# Slot indices are 0-based and comma-separated inside square brackets.",
         "#",
+        "# excluded_items: comma-separated list of items to exclude from aspect calculation",
+        "# (applied to both inputs and outputs). Format: modid:item@metadata or modid:item",
+        "# Omitting @metadata matches all metadata values.",
+        "#",
         "# Example - patch vanilla crafting recipes:",
         "#   minecraft:crafting",
         "# Example - patch Thaumcraft arcane crafting, skip output slot 1:",
         "#   thaumcraft:arcane_crafting:[]:[1]",
+        "# Example - exclude specific items from aspect calculation:",
+        "#   minecraft:crafting:[]:[]:[minecraft:stick,minecraft:planks@0]",
         "# Example - category whose UID has no colon:",
         "#   ic2.RecipeCategory",
         "# Example - patch all recipes in a custom JEI category:",
@@ -80,7 +86,7 @@ public class TRAPConfig {
                 CONFIG_CATEGORY,
                 DEFAULT_RULES,
                 "Recipe processing rules. Add one rule per line.\n"
-                    + "Format: modid:recipe_type_id:[blacklist_inputs]:[blacklist_outputs]"
+                    + "Format: modid:recipe_type_id:[blacklist_inputs]:[blacklist_outputs]:[excluded_items]"
             );
 
             rules.clear();
@@ -114,15 +120,17 @@ public class TRAPConfig {
      * Returns null and logs a warning on parse failure.
      *
      * Grammar:
-     *   <uid>                                      (direct UID, no colon)
-     *   <modid>:<recipe_type_id>                   (modid + type)
-     *   <modid>:<recipe_type_id>:[<slots>]         (+ input blacklist)
-     *   <modid>:<recipe_type_id>:[<slots>]:[<slots>] (+ output blacklist)
+     *   <uid>                                                  (direct UID, no colon)
+     *   <modid>:<recipe_type_id>                               (modid + type)
+     *   <modid>:<recipe_type_id>:[<slots>]                     (+ input blacklist)
+     *   <modid>:<recipe_type_id>:[<slots>]:[<slots>]           (+ output blacklist)
+     *   <modid>:<recipe_type_id>:[<slots>]:[<slots>]:[<items>] (+ excluded items)
      *
      * If the line contains no colon before the first '[', the entire non-bracket
      * portion is treated as a direct JEI category UID (modId stored as "").
      *
      * where <slots> = comma-separated integers, may be empty.
+     * where <items> = comma-separated item identifiers (modid:item@metadata or modid:item).
      */
     private RecipeRule parseLine(String line) {
         try {
@@ -131,6 +139,7 @@ public class TRAPConfig {
             String idPart;
             String inputPart = "";
             String outputPart = "";
+            String itemsPart = "";
 
             int bracketStart = line.indexOf(":[");
             if (bracketStart >= 0) {
@@ -152,6 +161,17 @@ public class TRAPConfig {
                     int closeSecond = outputSection.indexOf(']');
                     if (closeSecond >= 0) {
                         outputPart = outputSection.substring(1, closeSecond).trim();
+
+                        // look for third bracket section `:[ ` (excluded items)
+                        String afterSecond = outputSection.substring(closeSecond + 1);
+                        int thirdBracket = afterSecond.indexOf(":[");
+                        if (thirdBracket >= 0) {
+                            String itemsSection = afterSecond.substring(thirdBracket + 1);
+                            int closeThird = itemsSection.indexOf(']');
+                            if (closeThird >= 0) {
+                                itemsPart = itemsSection.substring(1, closeThird).trim();
+                            }
+                        }
                     }
                 }
             } else {
@@ -181,8 +201,9 @@ public class TRAPConfig {
 
             Set<Integer> inputBlacklist = parseSlots(inputPart);
             Set<Integer> outputBlacklist = parseSlots(outputPart);
+            Set<String> excludedItems = parseItemList(itemsPart);
 
-            return new RecipeRule(modId, recipeTypeId, inputBlacklist, outputBlacklist);
+            return new RecipeRule(modId, recipeTypeId, inputBlacklist, outputBlacklist, excludedItems);
 
         } catch (Exception e) {
             LOGGER.warn("Failed to parse rule '{}': {}", line, e.getMessage());
@@ -204,6 +225,25 @@ public class TRAPConfig {
                 } catch (NumberFormatException e) {
                     LOGGER.warn("Invalid slot index '{}', ignoring.", t);
                 }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Parses a comma-separated item list into a Set of item identifier strings.
+     * Each entry should be "modid:itemname@metadata" or "modid:itemname".
+     * Entries are stored as-is (lowercased) for comparison against ItemStack registry names.
+     */
+    private Set<String> parseItemList(String raw) {
+        Set<String> result = new LinkedHashSet<>();
+        if (raw == null || raw.isEmpty()) {
+            return result;
+        }
+        for (String tok : raw.split(",")) {
+            String t = tok.trim().toLowerCase(java.util.Locale.ROOT);
+            if (!t.isEmpty()) {
+                result.add(t);
             }
         }
         return result;

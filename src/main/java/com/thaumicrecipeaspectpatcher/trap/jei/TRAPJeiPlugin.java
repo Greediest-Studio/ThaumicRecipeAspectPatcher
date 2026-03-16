@@ -151,6 +151,7 @@ public class TRAPJeiPlugin implements IModPlugin {
             // Multiple stacks in one slot = alternates; use the first as representative.
             ItemStack rep = slotStacks.get(0);
             if (rep == null || rep.isEmpty()) continue;
+            if (rule.isItemExcluded(rep)) continue;
             AspectList itemAspects = ThaumcraftApi.internalMethods.getObjectAspects(rep);
             if (itemAspects == null) continue;
             // getObjectAspects returns per-item values; scale by actual slot count.
@@ -174,6 +175,7 @@ public class TRAPJeiPlugin implements IModPlugin {
             if (slotStacks == null) continue;
             for (ItemStack output : slotStacks) {
                 if (output == null || output.isEmpty()) continue;
+                if (rule.isItemExcluded(output)) continue;
                 int outCount = Math.max(1, output.getCount());
                 AspectList perItem = scaleAspects(summed, outCount);
                 result.add(TRAPCache.Entry.of(output, perItem));
